@@ -1,5 +1,6 @@
 # This is a basic VCL configuration file for PageCache powered by Varnish for Magento module.
 
+vcl 4.0;
 # include variable handling methods
 include "vars.vcl";
 
@@ -44,34 +45,34 @@ sub vcl_recv {
         }
     }
 
-    if (req.request != "GET" &&
-        req.request != "HEAD" &&
-        req.request != "PUT" &&
-        req.request != "POST" &&
-        req.request != "TRACE" &&
-        req.request != "OPTIONS" &&
-        req.request != "DELETE" &&
-        req.request != "PURGE") {
+    if (req.method != "GET" &&
+        req.method != "HEAD" &&
+        req.method != "PUT" &&
+        req.method != "POST" &&
+        req.method != "TRACE" &&
+        req.method != "OPTIONS" &&
+        req.method != "DELETE" &&
+        req.method != "PURGE") {
         /* Non-RFC2616 or CONNECT which is weird. */
         return (pipe);
     }
 
     # purge request
-    if (req.request == "PURGE") {
+    if (req.method == "PURGE") {
         if (!client.ip ~ purge) {
-            error 405 "Not allowed.";
+            return (synth(405, "Not allowed."));
         }
         ban("obj.http.X-Purge-Host ~ " + req.http.X-Purge-Host + " && obj.http.X-Purge-URL ~ " + req.http.X-Purge-Regex + " && obj.http.Content-Type ~ " + req.http.X-Purge-Content-Type);
-        error 200 "Purged.";
+        return (synth(200, "Purged."));
     }
 
     # switch to admin backend configuration
     if (req.http.cookie ~ "adminhtml=") {
-        set req.backend = admin;
+        set req.backend_hint = admin;
     }
 
     # we only deal with GET and HEAD by default
-    if (req.request != "GET" && req.request != "HEAD") {
+    if (req.method != "GET" && req.method != "HEAD") {
         return (pass);
     }
 
@@ -95,7 +96,7 @@ sub vcl_recv {
         # create formkey once
         if (req.esi_level == 0) {
             C{
-                generate_formkey(sp, 16);
+                generate_formkey(ctx, 16);
             }C
             set req.http.x-var-input = req.http.X-Pagecache-Formkey;
             call var_set;
@@ -108,7 +109,7 @@ sub vcl_recv {
     # formkey lookup
     if (req.url ~ "/varnishcache/getformkey/") {
 	    call var_get;
-        error 760 req.http.x-var-output;
+        return (synth(760, req.http.x-var-output));
     }
 
     # not cacheable by default
@@ -131,7 +132,7 @@ sub vcl_recv {
     set req.url = regsuball(req.url, "\?gclid=[^&]+&", "?"); # strips when QS = "?gclid=AAA&foo=bar"
     set req.url = regsuball(req.url, "&gclid=[^&]+",   "");  # strips when QS = "?foo=bar&gclid=AAA" or QS = "?foo=bar&gclid=AAA&bar=baz"
 
-    return (lookup);
+    return (hash);
 }
 
 # sub vcl_pipe {
@@ -163,13 +164,13 @@ sub vcl_hash {
             "\2"
         );
         hash_data(req.http.pageCacheEnv);
-        remove req.http.pageCacheEnv;
+        unset req.http.pageCacheEnv;
     }
 
     if (!(req.url ~ "^/(media|js|skin)/.*\.(png|jpg|jpeg|gif|css|js|swf|ico)$")) {
         call design_exception;
     }
-    return (hash);
+    return (lookup);
 }
 
 # sub vcl_hit {
@@ -180,13 +181,12 @@ sub vcl_hash {
 #     return (fetch);
 # }
 
-sub vcl_fetch {
+sub vcl_backend_response {
     if (beresp.status >= 500) {
        if (beresp.http.Content-Type ~ "text/xml") {
            return (deliver);
        }
-       set beresp.saintmode = 10s;
-       return (restart);
+       return (retry);
     }
     set beresp.grace = 5m;
 
@@ -196,14 +196,15 @@ sub vcl_fetch {
     }
 
     # add ban-lurker tags to object
-    set beresp.http.X-Purge-URL  = req.url;
-    set beresp.http.X-Purge-Host = req.http.host;
+    set beresp.http.X-Purge-URL  = bereq.url;
+    set beresp.http.X-Purge-Host = bereq.http.host;
 
     if (beresp.status == 200 || beresp.status == 301 || beresp.status == 404) {
         if (beresp.http.Content-Type ~ "text/html" || beresp.http.Content-Type ~ "text/xml") {
             if ((beresp.http.Set-Cookie ~ "NO_CACHE=") || (beresp.ttl < 1s)) {
                 set beresp.ttl = 0s;
-                return (hit_for_pass);
+                set beresp.uncacheable = true;
+                return (deliver);
             }
 
             # marker for vcl_deliver to reset Age:
@@ -218,7 +219,8 @@ sub vcl_fetch {
         return (deliver);
     }
 
-    return (hit_for_pass);
+    set beresp.uncacheable = true;
+    return (deliver);
 }
 
 sub vcl_deliver {
@@ -233,11 +235,11 @@ sub vcl_deliver {
         set resp.http.X-Cache-Expires  = resp.http.Expires;
     } else {
         # remove Varnish/proxy header
-        remove resp.http.X-Varnish;
-        remove resp.http.Via;
-        remove resp.http.Age;
-        remove resp.http.X-Purge-URL;
-        remove resp.http.X-Purge-Host;
+        unset resp.http.X-Varnish;
+        unset resp.http.Via;
+        unset resp.http.Age;
+        unset resp.http.X-Purge-URL;
+        unset resp.http.X-Purge-Host;
     }
 
     if (resp.http.magicmarker) {
@@ -251,46 +253,46 @@ sub vcl_deliver {
     }
 }
 
-sub vcl_error {
+sub vcl_backend_error {
     # workaround for possible security issue
-    if (req.url ~ "^\s") {
-        set obj.status = 400;
-        set obj.response = "Malformed request";
-        synthetic "";
-        return(deliver);
-    }
+    #if (beresp.url ~ "^\s") {
+    #    set beresp.status = 400;
+    #    set beresp.reason = "Malformed request";
+    #    synthetic("");
+    #    return(deliver);
+    #}
 
     # formkey request
-    if (obj.status == 760) {
-        set obj.status = 200;
-	    synthetic obj.response;
+    if (beresp.status == 760) {
+        set beresp.status = 200;
+	    synthetic(beresp.reason);
         return(deliver);
     }
 
     # error 200
-    if (obj.status == 200) {
+    if (beresp.status == 200) {
         return (deliver);
     }
 
-     set obj.http.Content-Type = "text/html; charset=utf-8";
-     set obj.http.Retry-After = "5";
-     synthetic {"
+     set beresp.http.Content-Type = "text/html; charset=utf-8";
+     set beresp.http.Retry-After = "5";
+     synthetic({"
 <?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html>
     <head>
-        <title>"} + obj.status + " " + obj.response + {"</title>
+        <title>"} + beresp.status + " " + beresp.reason + {"</title>
     </head>
     <body>
-        <h1>Error "} + obj.status + " " + obj.response + {"</h1>
-        <p>"} + obj.response + {"</p>
+        <h1>Error "} + beresp.status + " " +beresp.reason + {"</h1>
+        <p>"} + beresp.reason + {"</p>
         <h3>Guru Meditation:</h3>
-        <p>XID: "} + req.xid + {"</p>
+        <p>XID: "} + bereq.xid + {"</p>
         <hr>
         <p>Varnish cache server</p>
     </body>
 </html>
-"};
+"});
      return (deliver);
 }
 
@@ -312,7 +314,7 @@ C{
      * create a random alphanumeric string and store it in
      * the request header as X-Pagecache-Formkey
      */
-    char *generate_formkey(struct sess *sp, int maxLength) {
+    char *generate_formkey(const struct vrt_ctx *ctx, int maxLength) {
         char *validChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         int validCharsLength = strlen(validChars);
         char *result = (char *) malloc(maxLength + 1);
@@ -326,7 +328,7 @@ C{
         result[maxLength] = '\0';
 
         // set req.X-Country-Code header
-        VRT_SetHdr(sp, HDR_REQ, "\024X-Pagecache-Formkey:", result, vrt_magic_string_end);
+        VRT_SetHdr(ctx, HDR_REQ, "\024X-Pagecache-Formkey:", result, vrt_magic_string_end);
 
         return 0;
     }
