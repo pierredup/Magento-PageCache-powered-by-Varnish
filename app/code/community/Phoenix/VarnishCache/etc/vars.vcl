@@ -41,6 +41,14 @@ struct sess {
 	   here ... */
 };
 
+struct req {
+	unsigned		magic;
+#define REQ_MAGIC		0x2751aaa1
+
+	struct sess		*sp;
+};
+
+
 struct var {
 	unsigned	magic;
 #define VAR_MAGIC	0xbbd57783
@@ -82,12 +90,12 @@ int i;
 
 
 static struct var *
-get_var(struct sess *sp)
+get_var(const struct vrt_ctx *ctx)
 {
 	struct var *v;
 
 	AZ(pthread_mutex_lock(&var_list_mtx));
-	while (var_list_sz <= sp->id) {
+	while (var_list_sz <= ctx->req->sp->id) {
 		int ns = var_list_sz*2;
 		/* resize array */
 		var_list = realloc(var_list, ns * sizeof(struct var_entry *));
@@ -99,20 +107,20 @@ get_var(struct sess *sp)
 		assert(var_list_sz == ns);
 		AN(var_list);
 	}
-	v = var_list[sp->id];
+	v = var_list[ctx->req->sp->id];
 
-	if (v->xid != sp->xid) {
+	if (v->xid != ctx->req->sp->xid) {
 		var_clean(v);
-		v->xid = sp->xid;
+		v->xid = ctx->req->sp->xid;
 	}
 	AZ(pthread_mutex_unlock(&var_list_mtx));
 	return (v);
 }
 
 void
-vmod_set(struct sess *sp, const char *value)
+vmod_set(const struct vrt_ctx *ctx, const char *value)
 {
-	struct var *v = get_var(sp);
+        struct var *v = get_var(ctx);
 	CHECK_OBJ_NOTNULL(v, VAR_MAGIC);
 	var_clean(v);
 	if (value == NULL)
@@ -121,9 +129,9 @@ vmod_set(struct sess *sp, const char *value)
 }
 
 const char *
-vmod_get(struct sess *sp)
+vmod_get(const struct vrt_ctx *ctx)
 {
-	struct var *v = get_var(sp);
+        struct var *v = get_var(ctx);
 	CHECK_OBJ_NOTNULL(v, VAR_MAGIC);
 	return (v->value);
 }
@@ -138,13 +146,15 @@ sub vcl_init {
 # input: req.http.x-var-input
 sub var_set {
 	C{
-	    vmod_set(sp, VRT_GetHdr(sp, HDR_REQ, "\014X-var-input:"));
+            const struct gethdr_s hdr = { HDR_REQ, "\014X-var-input:" };
+	    vmod_set(ctx, VRT_GetHdr(ctx, &hdr));
 	}C
 }
 
 # output: req.http.x-var-output
 sub var_get {
 	C{
-	    VRT_SetHdr(sp, HDR_REQ, "\015X-var-output:", vmod_get(sp), vrt_magic_string_end);
+	    const struct gethdr_s hdr = { HDR_REQ, "\015X-var-output:" };
+	    VRT_SetHdr(ctx, &hdr, vmod_get(ctx), vrt_magic_string_end);
 	}C
 }
